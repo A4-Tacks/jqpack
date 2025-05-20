@@ -1,4 +1,4 @@
-Package a simple jq dependency tree into a single file
+Package a simple [jq-lang] dependency tree into a single file
 
 # Example
 
@@ -34,3 +34,5 @@ def extract_data: map_values(share::id - .foo);
 
 $data | sub::each | extract_data * {c: share::id}
 ```
+
+[jq-lang]: https://github.com/jqlang/jq
