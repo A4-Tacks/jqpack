@@ -1,0 +1,175 @@
+#!/usr/bin/bash
+# shellcheck disable=SC2016,SC2064
+set -o nounset
+set -o errtrace
+set -o pipefail
+function CATCH_ERROR {
+    local __LEC=$? __i __j
+    echo "Traceback (most recent call last):" >&2
+    for ((__i = ${#FUNCNAME[@]} - 1; __i >= 0; --__i)); do
+        printf '  File %q line %s in %q\n' >&2 \
+            "${BASH_SOURCE[__i]}" \
+            "${BASH_LINENO[__i]}" \
+            "${FUNCNAME[__i]}"
+        if ((BASH_LINENO[__i])) && [ -f "${BASH_SOURCE[__i]}" ]; then
+            for ((__j = 0; __j < BASH_LINENO[__i]; ++__j)); do
+                read -r REPLY
+            done < "${BASH_SOURCE[__i]}"
+            printf '    %s\n' "$REPLY" >&2
+        fi
+    done
+    echo "Error: [ExitCode: ${__LEC}]" >&2
+    exit "${__LEC}"
+}
+trap CATCH_ERROR ERR
+
+version=0.1.0
+
+duplicate_include=''
+duplicate_import_json=''
+quiet=''
+search_dirs=()
+
+function error { # {{{
+    printf "%q: $1\n" "$0" "${@:2}" >&2
+} # }}}
+
+OPTIND=1
+while getopts hd:o:L:qv opt; do case "$opt" in
+    h)
+        printf 'Usage: %q [Options] [MAIN]\n' "${0##*/}"
+        echo 'Package a simple jq dependency tree into a single file'
+        echo
+        echo 'Support:'
+        echo '    `include path;`:              include .jq file'
+        echo '    `import path as $object;`:    import .json objects'
+        echo
+        echo 'Need to be within one line, and there is only one statement within the line'
+        echo
+        echo 'Note: that this does not resolve scope and name conflicts'
+        echo
+        printf '%s\n' \
+            'Options:' \
+            '    -d <TYPE>          allow duplicate include, type: (json, include)' \
+            '    -o <FILE>          redirect output to file' \
+            '    -L <PATH>          search path' \
+            '    -q                 quiet mode' \
+            '    -h                 show help' \
+            '    -v                 version' \
+            && exit
+        ;;
+    d)  case "${OPTARG}" in
+        json) duplicate_import_json=1;;
+        include) duplicate_include=1;;
+        *)  error 'invalid -d value %s' "${OPTARG@Q}"
+            exit 2
+        esac;;
+    o)  exec >"$OPTARG";;
+    L)  search_dirs+=("$OPTARG");;
+    q)  quiet=1;;
+    v)  echo "$version"; exit;;
+    :|\?)
+        ((--OPTIND <= 0)) && OPTIND=1
+        error 'parse args failed, near by %q' "${!OPTIND}"
+        exit 2
+esac done
+set -- "${@:OPTIND}"
+if [ $# -gt 1 ]; then
+    error 'unexpected arg %q' "$2"
+    exit 2
+fi
+
+hash realpath mktemp jq cat readlink head || exit
+
+function resolv_path { # {{{
+    local dir pwd
+    realpath -eq --relative-to=. -- "$1" && return
+    pwd=$(pwd)
+    for dir in "${search_dirs[@]}"; do
+        (cd "$dir" && realpath -eq --relative-to="$pwd" -- "$1") && return
+    done
+    return 1
+} # }}}
+function quiet { # {{{
+    [ -n "$quiet" ] || "$@"
+} # }}}
+
+tmp=$(mktemp -d --tmpdir jqpack.XXXXXXXXXX)
+trap "rm -r -- ${tmp@Q}" exit
+
+for dir in "${search_dirs[@]}"; do
+    if ! test -d "$dir"; then
+        error 'cannot test %q: No such directory' "$dir"
+        exit 1
+    fi
+done
+
+declare -A processed=()
+
+main=${1-$(cat>"$tmp/stdin" && echo "$tmp/stdin")}
+
+capture='
+capture("
+    ^\\s*(?<type>import|include)
+    \\s*(?<path>\"([^\\\\]|\\\\.)+\")
+    (
+        \\s*as
+        \\s*(?<name>\\$[a-zA-Z0-9]+)
+    )?
+    \\s*;$";
+"x")'
+resolv_path_jq=$capture'
+| (if .type == "import" then ".json" else ".jq" end) as $ext
+| .path |= fromjson + $ext
+| .type, .path, .name+""
+'
+
+if [[ "$(head -n1 -- "$main")" = "#!"?* ]]; then
+    head -n1 -- "$main"
+fi
+
+function deps { # {{{
+    local indent=$1
+    shift
+
+    while
+        read -rd '' && type=$REPLY &&
+        read -rd '' && path=$REPLY &&
+        read -rd '' && name=$REPLY
+    do
+        target_path=$(resolv_path "$path") || {
+            error 'cannot find path %q' "$path"
+            exit 1
+        }
+
+        cached=''
+        [[ "${processed[$target_path]-__uninit__}" = *" $name "* ]] && cached=1
+
+        quiet printf -- '%s- %-7s %-16q%14s\t from %q%s\n' >&2 \
+            "$indent" "$type" "$path" "${name:+ as $name}" "$target_path" \
+            "${cached:+ (cached)}"
+
+        [ -n "$cached" ] && continue
+
+        case "${type}-$duplicate_import_json-$duplicate_include" in
+            import-1-*);;
+            include-*-1);;
+            *) processed[$target_path]+=" $name "
+        esac
+
+        case "${type}" in
+            import)
+                printf '# %q\n' "$target_path"
+                jq -ncj '[inputs]' -- "$target_path"; echo " as $name |";;
+            include)
+                deps "$indent  " "$target_path"
+                ;;
+        esac
+
+    done < <(jq -R "$resolv_path_jq" --raw-output0 -- "$@")
+
+    printf '# %q\n' "$@"
+    jq -Rr "$capture // . | strings" -- "$@"
+} # }}}
+
+deps "" "$main"
