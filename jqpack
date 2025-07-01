@@ -35,7 +35,11 @@ function error { # {{{
 } # }}}
 
 OPTIND=1
-while getopts hd:o:L:qv opt; do case "$opt" in
+args=()
+while case "${!OPTIND---}" in
+    -*?)false;;
+    *)  args+=("${!OPTIND}"); ((++OPTIND)); continue
+esac || getopts hd:o:L:qv opt; do case "$opt" in
     h)
         printf 'Usage: %q [Options] [MAIN]\n' "${0##*/}"
         echo 'Package a simple jq dependency tree into a single file'
@@ -73,7 +77,7 @@ while getopts hd:o:L:qv opt; do case "$opt" in
         error 'parse args failed, near by %q' "${!OPTIND}"
         exit 2
 esac done
-set -- "${@:OPTIND}"
+set -- "${args[@]}" "${@:OPTIND}"
 if [ $# -gt 1 ]; then
     error 'unexpected arg %q' "$2"
     exit 2
